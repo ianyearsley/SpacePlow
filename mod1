@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""
+SpacePlow
+
+An efficient file mover for postdata_*.bin files.
+
+Download Python3: sudo apt-get install python3
+Download and install asyncio with: pip install asyncio
+
+Run in the folder with python3 spaceplow.py
+
+Author: Ian Yearsley <theianyearsley@gmail.com
+Original Author: Luke Macken <phorex@protonmail.com>
+SPDX-License-Identifier: GPL-3.0-or-later
+"""
+import sys
+import glob
+import shutil
+import random
+import urllib.request
+import asyncio
+import aionotify
+from pathlib import Path
+from datetime import datetime
+from collections import defaultdict
+
+# Local file sources
+SOURCES = ["/mnt/DataAA/Space",]
+
+# Rsync destinations ["/mnt/postdata",192.168.1.1:/mnt/postdata,]
+DESTS = [
+"/mnt/SSD2R7202",
+   
+]
+
+# Shuffle destinations
+SHUFFLE = True 
+
+# Rsync bandwidth limiting
+BWLIMIT = None
+
+# Optionally set the I/O scheduling class and priority
+IONICE = None  # "-c 3" for "idle"
+
+# Only send 1 file at a time, regardless of source/dest. 
+ONE_AT_A_TIME = False
+
+# Each source can have a lock, so we don't send more than one file from
+# that origin at any given time.
+ONE_PER_DRIVE = False
+
+# Sleep durations upon various error conditions
+SLEEP_FOR = 60 * 3
+SLEEP_FOR_LONG = 60 * 20
+
+RSYNC_CMD = "rsync"
+
+if SHUFFLE:
+    random.shuffle(DESTS)
+
+# Rsync parameters
+if BWLIMIT:
+    RSYNC_FLAGS = f"--remove-source-files --preallocate --whole-file --bwlimit={BWLIMIT}"
+else:
+    RSYNC_FLAGS = "--remove-source-files --preallocate --whole-file"
+
+if IONICE:
+    RSYNC_CMD = f"ionice {IONICE} {RSYNC_CMD}"
+
+LOCK = asyncio.Lock()  # Global ONE_AT_A_TIME lock
+SRC_LOCKS = defaultdict(asyncio.Lock)  # ONE_PER_DRIVE locks
+
+async def filefinder(paths, file_queue, loop):
+    for path in paths:
+        for file in Path(path).glob("**/postdata_*.bin"):
+            await file_queue.put(file)
+    await filewatcher(paths, file_queue, loop)
+
+async def filewatcher(paths, file_queue, loop):
+    watcher = aionotify.Watcher()
+    for path in paths:
+        if not Path(path).exists():
+            print(f'! Path does not exist: {path}')
+            continue
+        print('watching', path)
+        watcher.watch(
+            alias=path,
+            path=path,
+            flags=aionotify.Flags.MOVED_TO,
+        )
+    await watcher.setup(loop)
+    while True:
+        event = await watcher.get_event()
+        if event.name.startswith("postdata_") and event.name.endswith(".bin"):
+            file_path = Path(event.alias) / event.name
+            await file_queue.put(file_path)
+
+async def plow(dest, file_queue, loop):
+    print(f"🧑‍🌾 plowing to {dest}")
+    while True:
+        try:
+            file = await file_queue.get()
+            cmd = f"{RSYNC_CMD} {RSYNC_FLAGS} {file} {dest}"
+
+            dest_path = Path(dest)
+            if dest_path.exists():
+                if not dest_path.is_mount():
+                    print(f"Destination {dest_path} is not mounted. Trying again later.")
+                    await file_queue.put(file)
+                    await asyncio.sleep(SLEEP_FOR)
+                    continue
+
+                file_size = file.stat().st_size
+                dest_free = shutil.disk_usage(dest).free
+                if dest_free < file_size:
+                    print(f"Destination {dest} is full")
+                    await file_queue.put(file)
+                    break
+
+            if ONE_AT_A_TIME:
+                await LOCK.acquire()
+
+            if ONE_PER_DRIVE:
+                await SRC_LOCKS[file.parent].acquire()
+
+            try:
+                print(f"🚜 {file} ➡️  {dest}")
+
+                test_cmd = f"rsync /etc/hostname {dest}"
+                proc = await asyncio.create_subprocess_shell(
+                    test_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await proc.communicate()
+                if proc.returncode != 0:
+                    print(f"⁉️  {test_cmd!r} exited with {proc.returncode}")
+                    await file_queue.put(file)
+                    break
+
+                proc = await asyncio.create_subprocess_shell(
+                    cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                start = datetime.now()
+                stdout, stderr = await proc.communicate()
+                finish = datetime.now()
+            finally:
+                if ONE_PER_DRIVE:
+                    SRC_LOCKS[file.parent].release()
+                if ONE_AT_A_TIME:
+                    LOCK.release()
+
+            if proc.returncode == 0:
+                print(f"🏁 {cmd} ({finish - start})")
+            else:
+                print(f"⁉️ {cmd!r} exited with {proc.returncode}")
+                await asyncio.sleep(SLEEP_FOR)
+                await file_queue.put(file)
+                print(f"{dest} plow exiting")
+                break
+            if stdout:
+                output = stdout.decode().strip()
+                if output:
+                    print(f"{stdout.decode()}")
+            if stderr:
+                print(f"⁉️ {stderr.decode()}")
+        except Exception as e:
+            print(f"! {e}")
+
+async def main(paths, loop):
+    file_queue = asyncio.Queue()
+    futures = []
+
+    futures.append(filefinder(paths, file_queue, loop))
+
+    for dest in DESTS:
+        futures.append(plow(dest, file_queue, loop))
+
+    print('🌱 Plow running...')
+    await asyncio.gather(*futures)
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main(SOURCES, loop))
+    except KeyboardInterrupt:
+        pass
